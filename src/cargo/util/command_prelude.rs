@@ -546,6 +546,7 @@ pub trait ArgMatchesExt {
         build_config.build_plan = self.flag("build-plan");
         build_config.unit_graph = self.flag("unit-graph");
         build_config.future_incompat_report = self.flag("future-incompat-report");
+        build_config.fail_fast = self.flag("fail-fast");
 
         if self._contains("timings") {
             for timing_output in self._values_of("timings") {

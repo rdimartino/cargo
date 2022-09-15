@@ -128,7 +128,7 @@ struct DrainState<'cfg> {
     queue: DependencyQueue<Unit, Artifact, Job>,
     messages: Arc<Queue<Message>>,
     /// Diagnostic deduplication support.
-    diag_dedupe: DiagDedupe<'cfg>,
+    diag_reporter: DiagReporter<'cfg>,
     /// Count of warnings, used to print a summary after the job succeeds.
     ///
     /// First value is the total number of warnings, and the second value is
@@ -236,7 +236,7 @@ pub struct JobState<'a, 'cfg> {
     /// interleaved. In the future, it may be wrapped in a `Mutex` instead. In this case
     /// interleaving is still prevented as the lock would be held for the whole printing of an
     /// output message.
-    output: Option<&'a DiagDedupe<'cfg>>,
+    output: Option<&'a DiagReporter<'cfg>>,
 
     /// The job id that this state is associated with, used when sending
     /// messages back to the main thread.
@@ -252,30 +252,88 @@ pub struct JobState<'a, 'cfg> {
     _marker: marker::PhantomData<&'a ()>,
 }
 
-/// Handler for deduplicating diagnostics.
-struct DiagDedupe<'cfg> {
-    seen: RefCell<HashSet<u64>>,
+/// Handler for reporting diagnostics.
+struct DiagReporter<'cfg> {
     config: &'cfg Config,
+    scheme: Box<dyn DiagReportScheme>,
 }
 
-impl<'cfg> DiagDedupe<'cfg> {
-    fn new(config: &'cfg Config) -> Self {
-        DiagDedupe {
-            seen: RefCell::new(HashSet::new()),
-            config,
-        }
+impl<'cfg> DiagReporter<'cfg> {
+    fn new(config: &'cfg Config, fail_fast: bool) -> Self {
+        let scheme: Box<dyn DiagReportScheme> = if fail_fast {
+            Box::new(DiagFF::new())
+        } else {
+            Box::new(DiagDedupe::new())
+        };
+        DiagReporter { config, scheme }
     }
 
+    fn emit_diag(&self, level: &str, diag: &str) -> CargoResult<bool> {
+        self.scheme.emit_diag(&self.config, level, diag)
+    }
+}
+
+trait DiagReportScheme {
+    fn emit_diag(&self, config: &Config, level: &str, diag: &str) -> CargoResult<bool>;
+}
+
+/// Scheme for deduplicating diagnostics.
+struct DiagDedupe {
+    seen: RefCell<HashSet<u64>>,
+}
+
+impl DiagDedupe {
+    fn new() -> Self {
+        DiagDedupe {
+            seen: RefCell::new(HashSet::new()),
+        }
+    }
+}
+
+impl DiagReportScheme for DiagDedupe {
     /// Emits a diagnostic message.
     ///
     /// Returns `true` if the message was emitted, or `false` if it was
     /// suppressed for being a duplicate.
-    fn emit_diag(&self, diag: &str) -> CargoResult<bool> {
+    fn emit_diag(&self, config: &Config, _level: &str, diag: &str) -> CargoResult<bool> {
         let h = util::hash_u64(diag);
-        if !self.seen.borrow_mut().insert(h) {
+        let test: bool = self.seen.borrow_mut().insert(h);
+        if !test {
             return Ok(false);
         }
-        let mut shell = self.config.shell();
+        let mut shell = config.shell();
+        shell.print_ansi_stderr(diag.as_bytes())?;
+        shell.err().write_all(b"\n")?;
+        Ok(true)
+    }
+}
+
+/// Scheme for fast-failing diagnositics (only reporting first error)
+struct DiagFF {
+    reported: RefCell<Option<()>>,
+}
+
+impl DiagFF {
+    fn new() -> Self {
+        DiagFF {
+            reported: RefCell::new(None),
+        }
+    }
+}
+
+impl DiagReportScheme for DiagFF {
+    fn emit_diag(&self, config: &Config, level: &str, diag: &str) -> CargoResult<bool> {
+        if level == "warning" {
+            return Ok(false);
+        }
+        if level == "error" {
+            if self.reported.borrow().is_some() {
+                return Ok(false);
+            } else {
+                _ = self.reported.borrow_mut().insert(());
+            }
+        }
+        let mut shell = config.shell();
         shell.print_ansi_stderr(diag.as_bytes())?;
         shell.err().write_all(b"\n")?;
         Ok(true)
@@ -344,8 +402,8 @@ impl<'a, 'cfg> JobState<'a, 'cfg> {
     }
 
     pub fn stdout(&self, stdout: String) -> CargoResult<()> {
-        if let Some(dedupe) = self.output {
-            writeln!(dedupe.config.shell().out(), "{}", stdout)?;
+        if let Some(reporter) = self.output {
+            writeln!(reporter.config.shell().out(), "{}", stdout)?;
         } else {
             self.messages.push_bounded(Message::Stdout(stdout));
         }
@@ -353,8 +411,8 @@ impl<'a, 'cfg> JobState<'a, 'cfg> {
     }
 
     pub fn stderr(&self, stderr: String) -> CargoResult<()> {
-        if let Some(dedupe) = self.output {
-            let mut shell = dedupe.config.shell();
+        if let Some(reporter) = self.output {
+            let mut shell = reporter.config.shell();
             shell.print_ansi_stderr(stderr.as_bytes())?;
             shell.err().write_all(b"\n")?;
         } else {
@@ -364,8 +422,9 @@ impl<'a, 'cfg> JobState<'a, 'cfg> {
     }
 
     pub fn emit_diag(&self, level: String, diag: String) -> CargoResult<()> {
-        if let Some(dedupe) = self.output {
-            let emitted = dedupe.emit_diag(&diag)?;
+        if let Some(reporter) = self.output {
+            // TODO: Do I need to bump error count here?
+            let emitted = reporter.emit_diag(&level, &diag)?;
             if level == "warning" {
                 self.messages.push(Message::WarningCount {
                     id: self.id,
@@ -514,7 +573,7 @@ impl<'cfg> JobQueue<'cfg> {
             // typical messages. If you change this, please update the test
             // caching_large_output, too.
             messages: Arc::new(Queue::new(100)),
-            diag_dedupe: DiagDedupe::new(cx.bcx.config),
+            diag_reporter: DiagReporter::new(cx.bcx.config, cx.bcx.build_config.fail_fast),
             warning_count: HashMap::new(),
             active: HashMap::new(),
             compiled: HashSet::new(),
@@ -680,9 +739,13 @@ impl<'cfg> DrainState<'cfg> {
                 shell.err().write_all(b"\n")?;
             }
             Message::Diagnostic { id, level, diag } => {
-                let emitted = self.diag_dedupe.emit_diag(&diag)?;
+                // Add an argument to the build plan
+                // Use the argument here to only emit the first error
+                // Rebuild the diag_reporter class?
+                let emitted = self.diag_reporter.emit_diag(&level, &diag)?;
                 if level == "warning" {
                     self.bump_warning_count(id, emitted);
+                } else if level == "error" {
                 }
             }
             Message::WarningCount { id, emitted } => {
@@ -1075,7 +1138,7 @@ impl<'cfg> DrainState<'cfg> {
                 doit(JobState {
                     id,
                     messages,
-                    output: Some(&self.diag_dedupe),
+                    output: Some(&self.diag_reporter),
                     rmeta_required: Cell::new(rmeta_required),
                     _marker: marker::PhantomData,
                 });
